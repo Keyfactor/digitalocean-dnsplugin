@@ -13,6 +13,12 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
     {
         private static readonly ILogger _logger = LogHandler.GetClassLogger<DigitalOceanProvider>();
 
+        // Bounds any DigitalOcean list-endpoint pagination loop against a malformed/cyclic `next`
+        // link (API bug or future change) so a broken pagination response can't hang
+        // StageValidation/CleanupValidation forever. 5,000 pages at 200/page is 1,000,000 items --
+        // far beyond any realistic account's domain or per-zone record count.
+        private const int MaxPaginationPages = 5000;
+
         private readonly HttpClient _httpClient;
 
         private class DomainData
@@ -64,6 +70,9 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
         {
             [JsonPropertyName("domain_records")]
             public RecordData[] DomainRecords { get; set; }
+
+            [JsonPropertyName("links")]
+            public LinksData Links { get; set; }
         }
 
         private class CreateRecordResponse
@@ -146,19 +155,41 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
             var zone = await FindZoneForRecordAsync(recordName, cancellationToken);
             var relativeName = RelativeRecordName(zone, recordName);
 
-            var recordsResp = await _httpClient.GetAsync($"domains/{zone}/records?type={recordType}", cancellationToken);
-            var recordsBody = StripControlCharacters(await recordsResp.Content.ReadAsStringAsync(cancellationToken));
-            if (!recordsResp.IsSuccessStatusCode)
+            // Paged the same way as FindZoneForRecordAsync's domain listing: a zone can accumulate
+            // more than one page of records (other TXT records, multiple concurrent SAN
+            // challenges, or previously-stranded records), and an un-paginated fetch would make
+            // records on page 2+ invisible to the match below -- silently treating a genuinely
+            // still-live record as "not found" and reporting cleanup as complete without deleting
+            // it, leaving it in DNS indefinitely.
+            var records = new List<RecordData>();
+            var nextRecordsUri = $"domains/{zone}/records?type={recordType}&per_page=200";
+            var recordsPageCount = 0;
+
+            while (!string.IsNullOrEmpty(nextRecordsUri))
             {
-                _logger.LogError(
-                    "DigitalOcean API failed to list records for zone '{Zone}'. Status: {StatusCode}. Response: {Response}",
-                    zone, (int)recordsResp.StatusCode, recordsBody);
+                recordsPageCount++;
+                if (recordsPageCount > MaxPaginationPages)
+                {
+                    throw new InvalidOperationException(
+                        $"DigitalOcean record list pagination for zone '{zone}' exceeded {MaxPaginationPages} pages without terminating; aborting.");
+                }
 
-                throw new InvalidOperationException(
-                    $"DigitalOcean API returned {(int)recordsResp.StatusCode} ({recordsResp.StatusCode}) listing records in zone '{zone}': {recordsBody}");
+                var recordsResp = await _httpClient.GetAsync(nextRecordsUri, cancellationToken);
+                var recordsBody = StripControlCharacters(await recordsResp.Content.ReadAsStringAsync(cancellationToken));
+                if (!recordsResp.IsSuccessStatusCode)
+                {
+                    _logger.LogError(
+                        "DigitalOcean API failed to list records for zone '{Zone}'. Status: {StatusCode}. Response: {Response}",
+                        zone, (int)recordsResp.StatusCode, recordsBody);
+
+                    throw new InvalidOperationException(
+                        $"DigitalOcean API returned {(int)recordsResp.StatusCode} ({recordsResp.StatusCode}) listing records in zone '{zone}': {recordsBody}");
+                }
+
+                var recordsPage = JsonSerializer.Deserialize<RecordsResponse>(recordsBody);
+                records.AddRange(recordsPage?.DomainRecords ?? Array.Empty<RecordData>());
+                nextRecordsUri = recordsPage?.Links?.Pages?.Next;
             }
-
-            var records = JsonSerializer.Deserialize<RecordsResponse>(recordsBody)?.DomainRecords ?? Array.Empty<RecordData>();
 
             // When multiple records share the same name/type (e.g. an apex + wildcard SAN both
             // challenging at the same _acme-challenge FQDN with different values), matching by
@@ -216,20 +247,15 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
 
             var zoneNames = new List<string>();
             var nextUri = "domains?per_page=200";
-
-            // Bounds the loop against a malformed/cyclic `next` link (API bug or future change) so
-            // a broken pagination response can't hang StageValidation/CleanupValidation forever.
-            // 5,000 pages at 200/page is 1,000,000 domains -- far beyond any realistic account size.
-            const int maxPages = 5000;
             var pageCount = 0;
 
             while (!string.IsNullOrEmpty(nextUri))
             {
                 pageCount++;
-                if (pageCount > maxPages)
+                if (pageCount > MaxPaginationPages)
                 {
                     throw new InvalidOperationException(
-                        $"DigitalOcean domain list pagination exceeded {maxPages} pages without terminating; aborting.");
+                        $"DigitalOcean domain list pagination exceeded {MaxPaginationPages} pages without terminating; aborting.");
                 }
 
                 // `next` (when present) is an ABSOLUTE URL from DigitalOcean's HATEOAS-style

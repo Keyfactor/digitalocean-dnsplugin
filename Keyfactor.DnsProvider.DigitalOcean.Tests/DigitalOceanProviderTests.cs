@@ -230,6 +230,56 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean.Tests
         }
 
         [Fact]
+        public async Task DeleteRecordAsync_FollowsPaginationToFindRecordOnLaterPage()
+        {
+            // A zone can have more than one page of records (other TXT records, concurrent SAN
+            // challenges, etc.) -- the target record living on page 2+ must not be treated as
+            // "not found" just because the first page didn't contain it.
+            var recordsRequests = new List<HttpRequestMessage>();
+            HttpRequestMessage deleteRequest = null;
+
+            var handler = new FakeHttpMessageHandler(req =>
+            {
+                if (req.Method == HttpMethod.Get && req.RequestUri.PathAndQuery.Contains("/domains?"))
+                {
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
+                        "{\"domains\":[{\"name\":\"example.com\"}],\"links\":{}}");
+                }
+
+                if (req.Method == HttpMethod.Get && req.RequestUri.AbsolutePath.Equals("/v2/domains/example.com/records", StringComparison.OrdinalIgnoreCase))
+                {
+                    recordsRequests.Add(req);
+                    if (recordsRequests.Count == 1)
+                    {
+                        return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
+                            "{\"domain_records\":[{\"id\":1,\"type\":\"TXT\",\"name\":\"unrelated\",\"data\":\"x\",\"ttl\":300}]," +
+                            "\"links\":{\"pages\":{\"next\":\"https://api.digitalocean.com/v2/domains/example.com/records?type=TXT&page=2&per_page=200\"}}}");
+                    }
+
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
+                        "{\"domain_records\":[{\"id\":7,\"type\":\"TXT\",\"name\":\"_acme-challenge\",\"data\":\"abc123\",\"ttl\":300}]}");
+                }
+
+                if (req.Method == HttpMethod.Delete)
+                {
+                    deleteRequest = req;
+                    return new HttpResponseMessage(HttpStatusCode.NoContent);
+                }
+
+                throw new InvalidOperationException($"Unexpected request: {req.Method} {req.RequestUri}");
+            });
+
+            var provider = new DigitalOceanProvider("token", handler);
+
+            var result = await provider.DeleteRecordAsync("_acme-challenge.example.com", "TXT");
+
+            Assert.True(result);
+            Assert.Equal(2, recordsRequests.Count);
+            Assert.NotNull(deleteRequest);
+            Assert.EndsWith("domains/example.com/records/7", deleteRequest.RequestUri.PathAndQuery);
+        }
+
+        [Fact]
         public async Task DeleteRecordAsync_IsIdempotentWhenRecordAlreadyGone()
         {
             var handler = new FakeHttpMessageHandler(req =>
