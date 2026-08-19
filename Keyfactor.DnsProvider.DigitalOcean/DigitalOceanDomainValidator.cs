@@ -38,6 +38,13 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
         // nothing ever dequeues. Different keys still run fully in parallel; only same-key
         // operations are serialized. Guarded by `_locksLock`, a separate, short-lived lock used
         // only to get-or-create a key's semaphore -- never held across an await.
+        //
+        // Neither this dictionary nor `_stagedValues` ever evicts an entry, so both grow for the
+        // life of the validator instance, one entry per distinct FQDN ever staged/cleaned up.
+        // Accepted: per-entry cost is small, a validator instance's lifetime is bounded by the
+        // hosting gateway process (restarted periodically for patching), and `key` values are
+        // domain names from certificates this account is actually enrolling, not attacker-supplied
+        // input from an untrusted boundary.
         private readonly Dictionary<string, SemaphoreSlim> _keyLocks = new();
         private readonly object _locksLock = new();
 
@@ -87,9 +94,17 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
         public async Task<DomainValidationResult> StageValidation(string key, string value, CancellationToken cancellationToken)
         {
             var keyLock = GetKeyLock(key);
-            await keyLock.WaitAsync(cancellationToken);
+            var lockAcquired = false;
             try
             {
+                // Waiting for the lock (not just the work after it) must be inside this try block:
+                // if cancellationToken fires while queued behind another same-key operation,
+                // WaitAsync throws, and this class's documented contract is that NO exception may
+                // escape StageValidation -- it must always come back as a caught, logged
+                // Success=false result.
+                await keyLock.WaitAsync(cancellationToken);
+                lockAcquired = true;
+
                 var success = await _provider.CreateRecordAsync(key, value, RecordTypeName, cancellationToken);
 
                 if (success)
@@ -114,16 +129,26 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
             }
             finally
             {
-                keyLock.Release();
+                if (lockAcquired)
+                {
+                    keyLock.Release();
+                }
             }
         }
 
         public async Task<DomainValidationResult> CleanupValidation(string key, CancellationToken cancellationToken)
         {
             var keyLock = GetKeyLock(key);
-            await keyLock.WaitAsync(cancellationToken);
+            var lockAcquired = false;
             try
             {
+                // See the identical comment in StageValidation: waiting for the lock must be
+                // inside this try block so a cancellation while queued behind another same-key
+                // operation is caught and converted to a logged Success=false, not an escaping
+                // exception.
+                await keyLock.WaitAsync(cancellationToken);
+                lockAcquired = true;
+
                 // Peek (don't remove) the oldest still-pending staged value. It is only actually
                 // dequeued below once DeleteRecordAsync confirms success — removing it up front
                 // would permanently lose it if the delete failed/was retried, corrupting the queue
@@ -174,7 +199,10 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
             }
             finally
             {
-                keyLock.Release();
+                if (lockAcquired)
+                {
+                    keyLock.Release();
+                }
             }
         }
 

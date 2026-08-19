@@ -252,5 +252,54 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean.Tests
             Assert.Equal(1, maxRecordsInFlight);
             Assert.Equal(new[] { "10", "11" }, deletedIds.OrderBy(x => x));
         }
+
+        [Fact]
+        public async Task CleanupValidation_ReturnsFailureInsteadOfThrowing_WhenCanceledWhileWaitingForKeyLock()
+        {
+            // Regression test: cancellation while queued behind another same-key operation must be
+            // caught and returned as Success=false, per this class's documented contract that no
+            // exception may escape into the gateway -- not just cancellation during the HTTP call.
+            var firstCallGate = new ManualResetEventSlim(false);
+            var releaseFirstCall = new ManualResetEventSlim(false);
+
+            var handler = new FakeHttpMessageHandler(req =>
+            {
+                if (req.Method == HttpMethod.Get && req.RequestUri.PathAndQuery.Contains("/domains?"))
+                {
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
+                        "{\"domains\":[{\"name\":\"example.com\"}],\"links\":{}}");
+                }
+
+                if (req.Method == HttpMethod.Get && req.RequestUri.PathAndQuery.Contains("/records"))
+                {
+                    firstCallGate.Set();
+                    releaseFirstCall.Wait(TimeSpan.FromSeconds(5));
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.OK, "{\"domain_records\":[]}");
+                }
+
+                throw new InvalidOperationException($"Unexpected request: {req.Method} {req.RequestUri}");
+            });
+
+            var provider = new DigitalOceanProvider("token", handler);
+            var validator = new DigitalOceanDomainValidator(provider);
+
+            const string key = "_acme-challenge.example.com";
+            var firstCall = validator.CleanupValidation(key, CancellationToken.None);
+
+            Assert.True(firstCallGate.Wait(TimeSpan.FromSeconds(5)), "first call did not reach the records lookup in time");
+
+            using var cts = new CancellationTokenSource();
+            var secondCall = validator.CleanupValidation(key, cts.Token);
+            await Task.Delay(50);
+            cts.Cancel();
+
+            var secondResult = await secondCall;
+            Assert.False(secondResult.Success);
+            Assert.NotNull(secondResult.ErrorMessage);
+
+            releaseFirstCall.Set();
+            var firstResult = await firstCall;
+            Assert.True(firstResult.Success);
+        }
     }
 }
