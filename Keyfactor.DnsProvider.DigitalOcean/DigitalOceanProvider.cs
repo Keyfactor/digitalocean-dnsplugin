@@ -107,7 +107,12 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
             var content = new StringContent(json, Encoding.UTF8, "application/json");
 
             var response = await _httpClient.PostAsync($"domains/{zone}/records", content, cancellationToken);
-            var result = await response.Content.ReadAsStringAsync(cancellationToken);
+            // Sanitized immediately: this is DigitalOcean-controlled response content, not just
+            // plugin-derived values, but it still reaches log/exception sinks below, so it's
+            // subject to the same CWE-117 CRLF log-forging risk as any other logged value. Valid
+            // JSON never contains raw (unescaped) control characters, so this is a no-op on the
+            // success/deserialization path.
+            var result = StripControlCharacters(await response.Content.ReadAsStringAsync(cancellationToken));
 
             if (!response.IsSuccessStatusCode)
             {
@@ -119,9 +124,10 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
                     $"DigitalOcean API returned {(int)response.StatusCode} ({response.StatusCode}) creating {recordType} record '{relativeName}' in zone '{zone}': {result}");
             }
 
+            var createdId = JsonSerializer.Deserialize<CreateRecordResponse>(result)?.DomainRecord?.Id;
             _logger.LogInformation(
-                "Created {RecordType} record '{RelativeName}' in DigitalOcean zone '{Zone}'",
-                recordType, relativeName, zone);
+                "Created {RecordType} record '{RelativeName}' ({RecordId}) in DigitalOcean zone '{Zone}'",
+                recordType, relativeName, createdId, zone);
             return true;
         }
 
@@ -134,7 +140,7 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
             var relativeName = RelativeRecordName(zone, recordName);
 
             var recordsResp = await _httpClient.GetAsync($"domains/{zone}/records?type={recordType}", cancellationToken);
-            var recordsBody = await recordsResp.Content.ReadAsStringAsync(cancellationToken);
+            var recordsBody = StripControlCharacters(await recordsResp.Content.ReadAsStringAsync(cancellationToken));
             if (!recordsResp.IsSuccessStatusCode)
             {
                 _logger.LogError(
@@ -174,7 +180,7 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
 
             if (!deleteResp.IsSuccessStatusCode)
             {
-                var deleteBody = await deleteResp.Content.ReadAsStringAsync(cancellationToken);
+                var deleteBody = StripControlCharacters(await deleteResp.Content.ReadAsStringAsync(cancellationToken));
                 _logger.LogError(
                     "DigitalOcean API rejected deletion of {RecordType} record '{RelativeName}' ({RecordId}) in zone '{Zone}'. Status: {StatusCode}. Response: {Response}",
                     recordType, relativeName, match.Id, zone, (int)deleteResp.StatusCode, deleteBody);
@@ -227,7 +233,7 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
                 // segment and, combined with BaseAddress already ending in "/v2/", doubles it into
                 // "/v2/v2/...", which the real API 404s.
                 var response = await _httpClient.GetAsync(nextUri, cancellationToken);
-                var body = await response.Content.ReadAsStringAsync(cancellationToken);
+                var body = StripControlCharacters(await response.Content.ReadAsStringAsync(cancellationToken));
 
                 if (!response.IsSuccessStatusCode)
                 {

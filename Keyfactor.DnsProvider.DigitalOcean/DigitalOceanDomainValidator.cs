@@ -25,9 +25,21 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
         // at the same _acme-challenge FQDN). CleanupValidation's own signature (key only, no value)
         // can't tell us which record to delete, so this queue records staging order per key on a
         // best-effort FIFO basis: cleanup for a key removes the oldest still-pending value staged
-        // for it. A lock guards concurrent Stage/Cleanup calls across SANs on the same instance.
+        // for it.
         private readonly Dictionary<string, Queue<string>> _stagedValues = new();
-        private readonly object _stagedValuesLock = new();
+
+        // Serializes ALL Stage/Cleanup calls for the SAME key end-to-end, including the network
+        // round-trip -- not just the queue peek/dequeue. A lock held only around the queue
+        // read/write (and released across the `await DeleteRecordAsync(...)` call) is not enough:
+        // two concurrent CleanupValidation calls for the same key could both peek the same head
+        // value before either dequeues it, so one call's delete succeeds while the other's
+        // redundant delete finds nothing (idempotent no-op) and ALSO reports success -- silently
+        // leaking the second call's real, distinct record and leaving a stale queue entry that
+        // nothing ever dequeues. Different keys still run fully in parallel; only same-key
+        // operations are serialized. Guarded by `_locksLock`, a separate, short-lived lock used
+        // only to get-or-create a key's semaphore -- never held across an await.
+        private readonly Dictionary<string, SemaphoreSlim> _keyLocks = new();
+        private readonly object _locksLock = new();
 
         public DigitalOceanDomainValidator()
         {
@@ -74,21 +86,15 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
 
         public async Task<DomainValidationResult> StageValidation(string key, string value, CancellationToken cancellationToken)
         {
+            var keyLock = GetKeyLock(key);
+            await keyLock.WaitAsync(cancellationToken);
             try
             {
                 var success = await _provider.CreateRecordAsync(key, value, RecordTypeName, cancellationToken);
 
                 if (success)
                 {
-                    lock (_stagedValuesLock)
-                    {
-                        if (!_stagedValues.TryGetValue(key, out var queue))
-                        {
-                            queue = new Queue<string>();
-                            _stagedValues[key] = queue;
-                        }
-                        queue.Enqueue(value);
-                    }
+                    GetQueue(key, createIfMissing: true).Enqueue(value);
                 }
 
                 return new DomainValidationResult
@@ -106,30 +112,28 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
                     ErrorMessage = $"Failed to create {RecordTypeName} record for {SafeForLog(key)}: {ex.Message}"
                 };
             }
+            finally
+            {
+                keyLock.Release();
+            }
         }
 
         public async Task<DomainValidationResult> CleanupValidation(string key, CancellationToken cancellationToken)
         {
+            var keyLock = GetKeyLock(key);
+            await keyLock.WaitAsync(cancellationToken);
             try
             {
                 // Peek (don't remove) the oldest still-pending staged value. It is only actually
                 // dequeued below once DeleteRecordAsync confirms success — removing it up front
                 // would permanently lose it if the delete failed/was retried, corrupting the queue
-                // for any later retry or sibling cleanup call on this key.
-                string expectedValue = null;
-                int outstandingCount;
-                lock (_stagedValuesLock)
-                {
-                    if (_stagedValues.TryGetValue(key, out var queue) && queue.Count > 0)
-                    {
-                        expectedValue = queue.Peek();
-                        outstandingCount = queue.Count;
-                    }
-                    else
-                    {
-                        outstandingCount = 0;
-                    }
-                }
+                // for any later retry or sibling cleanup call on this key. Holding `keyLock` for
+                // the entire method (including the network round-trip) guarantees no other
+                // Stage/Cleanup call for this SAME key can observe or mutate the queue in between,
+                // so this peek-then-conditionally-dequeue is race-free for a given key.
+                var queue = GetQueue(key, createIfMissing: false);
+                var outstandingCount = queue?.Count ?? 0;
+                var expectedValue = outstandingCount > 0 ? queue.Peek() : null;
 
                 if (outstandingCount > 1)
                 {
@@ -150,13 +154,7 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
 
                 if (success && expectedValue != null)
                 {
-                    lock (_stagedValuesLock)
-                    {
-                        if (_stagedValues.TryGetValue(key, out var queue) && queue.Count > 0 && queue.Peek() == expectedValue)
-                        {
-                            queue.Dequeue();
-                        }
-                    }
+                    queue.Dequeue();
                 }
 
                 return new DomainValidationResult
@@ -173,6 +171,10 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
                     Success = false,
                     ErrorMessage = $"Failed to delete {RecordTypeName} record for {SafeForLog(key)}: {ex.Message}"
                 };
+            }
+            finally
+            {
+                keyLock.Release();
             }
         }
 
@@ -205,5 +207,41 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
         // ErrorMessage call sites that log/embed the raw `key`, so it needs its own sanitization
         // pass to close the same CWE-117 CRLF log-forging gap at this layer.
         private static string SafeForLog(string key) => DigitalOceanProvider.StripControlCharacters(key);
+
+        private SemaphoreSlim GetKeyLock(string key)
+        {
+            lock (_locksLock)
+            {
+                if (!_keyLocks.TryGetValue(key, out var keyLock))
+                {
+                    keyLock = new SemaphoreSlim(1, 1);
+                    _keyLocks[key] = keyLock;
+                }
+                return keyLock;
+            }
+        }
+
+        // Only ever called while holding that key's semaphore (see GetKeyLock), so the returned
+        // Queue<string> is never accessed by more than one caller at a time and needs no further
+        // locking around Enqueue/Peek/Dequeue -- only the lookup/creation in the shared dictionary
+        // itself needs the brief `_locksLock` (reused here rather than adding a third lock, since
+        // it is already the lock guarding shared-dictionary structural changes for this class).
+        private Queue<string> GetQueue(string key, bool createIfMissing)
+        {
+            lock (_locksLock)
+            {
+                if (_stagedValues.TryGetValue(key, out var queue))
+                {
+                    return queue;
+                }
+                if (!createIfMissing)
+                {
+                    return null;
+                }
+                queue = new Queue<string>();
+                _stagedValues[key] = queue;
+                return queue;
+            }
+        }
     }
 }

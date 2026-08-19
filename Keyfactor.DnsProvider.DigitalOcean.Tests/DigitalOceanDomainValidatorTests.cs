@@ -179,5 +179,78 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean.Tests
             Assert.DoesNotContain("\r", result.ErrorMessage);
             Assert.DoesNotContain("\n", result.ErrorMessage);
         }
+
+        [Fact]
+        public async Task CleanupValidation_SerializesConcurrentCallsForTheSameKey()
+        {
+            // Regression test: two concurrent CleanupValidation calls for the same key must be
+            // fully serialized (including the network round-trip), not just around the queue
+            // peek/dequeue -- otherwise both could peek the same staged value before either
+            // dequeues it, letting one call's delete silently mask the loss of the other's.
+            var deletedIds = new List<string>();
+            var recordsInFlight = 0;
+            var maxRecordsInFlight = 0;
+            var gate = new object();
+
+            var handler = new FakeHttpMessageHandler(req =>
+            {
+                if (req.Method == HttpMethod.Get && req.RequestUri.PathAndQuery.Contains("/domains?"))
+                {
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
+                        "{\"domains\":[{\"name\":\"example.com\"}],\"links\":{}}");
+                }
+
+                if (req.Method == HttpMethod.Post)
+                {
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.Created,
+                        "{\"domain_record\":{\"id\":1,\"type\":\"TXT\",\"name\":\"_acme-challenge\",\"data\":\"ignored\",\"ttl\":300}}");
+                }
+
+                if (req.Method == HttpMethod.Get && req.RequestUri.PathAndQuery.Contains("/records"))
+                {
+                    lock (gate)
+                    {
+                        recordsInFlight++;
+                        maxRecordsInFlight = Math.Max(maxRecordsInFlight, recordsInFlight);
+                    }
+                    Thread.Sleep(50); // widens the window so an unserialized race would be observed
+                    lock (gate)
+                    {
+                        recordsInFlight--;
+                    }
+
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
+                        "{\"domain_records\":[" +
+                        "{\"id\":10,\"type\":\"TXT\",\"name\":\"_acme-challenge\",\"data\":\"value-A\",\"ttl\":300}," +
+                        "{\"id\":11,\"type\":\"TXT\",\"name\":\"_acme-challenge\",\"data\":\"value-B\",\"ttl\":300}]}");
+                }
+
+                if (req.Method == HttpMethod.Delete)
+                {
+                    lock (gate)
+                    {
+                        deletedIds.Add(req.RequestUri.PathAndQuery.Split('/').Last());
+                    }
+                    return new HttpResponseMessage(HttpStatusCode.NoContent);
+                }
+
+                throw new InvalidOperationException($"Unexpected request: {req.Method} {req.RequestUri}");
+            });
+
+            var provider = new DigitalOceanProvider("token", handler);
+            var validator = new DigitalOceanDomainValidator(provider);
+
+            const string key = "_acme-challenge.example.com";
+            await validator.StageValidation(key, "value-A", CancellationToken.None);
+            await validator.StageValidation(key, "value-B", CancellationToken.None);
+
+            var cleanup1 = validator.CleanupValidation(key, CancellationToken.None);
+            var cleanup2 = validator.CleanupValidation(key, CancellationToken.None);
+            var results = await Task.WhenAll(cleanup1, cleanup2);
+
+            Assert.All(results, r => Assert.True(r.Success));
+            Assert.Equal(1, maxRecordsInFlight);
+            Assert.Equal(new[] { "10", "11" }, deletedIds.OrderBy(x => x));
+        }
     }
 }
