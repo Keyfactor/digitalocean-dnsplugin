@@ -87,7 +87,14 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
 
             _httpClient = new HttpClient(handler)
             {
-                BaseAddress = new Uri("https://api.digitalocean.com/v2/")
+                BaseAddress = new Uri("https://api.digitalocean.com/v2/"),
+                // DigitalOceanDomainValidator holds a per-key lock across the entire Stage/Cleanup
+                // call, including every HTTP request this class makes -- without an explicit bound,
+                // a single stalled DigitalOcean connection falls back to HttpClient's 100-second
+                // default, and a Create/Delete can make 2-3 sequential requests, so an unrelated
+                // legitimate operation for the SAME key could queue behind a hung one for several
+                // minutes. 30 seconds is generous for a DNS record CRUD call under normal conditions.
+                Timeout = TimeSpan.FromSeconds(30)
             };
 
             _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiToken);

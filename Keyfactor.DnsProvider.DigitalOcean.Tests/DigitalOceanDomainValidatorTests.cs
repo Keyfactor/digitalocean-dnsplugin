@@ -301,5 +301,91 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean.Tests
             var firstResult = await firstCall;
             Assert.True(firstResult.Success);
         }
+
+        [Fact]
+        public async Task StageValidation_ReturnsFailureInsteadOfThrowing_WhenKeyIsNull()
+        {
+            // Regression test: GetKeyLock's dictionary lookup throws ArgumentNullException on a
+            // null key -- that call must be inside the try block so it comes back as a caught,
+            // logged Success=false result rather than an escaping exception.
+            var handler = new FakeHttpMessageHandler(_ =>
+                throw new InvalidOperationException("Should not make HTTP calls"));
+            var provider = new DigitalOceanProvider("token", handler);
+            var validator = new DigitalOceanDomainValidator(provider);
+
+            var result = await validator.StageValidation(null, "value", CancellationToken.None);
+
+            Assert.False(result.Success);
+            Assert.NotNull(result.ErrorMessage);
+        }
+
+        [Fact]
+        public async Task CleanupValidation_ReturnsFailureInsteadOfThrowing_WhenKeyIsNull()
+        {
+            var handler = new FakeHttpMessageHandler(_ =>
+                throw new InvalidOperationException("Should not make HTTP calls"));
+            var provider = new DigitalOceanProvider("token", handler);
+            var validator = new DigitalOceanDomainValidator(provider);
+
+            var result = await validator.CleanupValidation(null, CancellationToken.None);
+
+            Assert.False(result.Success);
+            Assert.NotNull(result.ErrorMessage);
+        }
+
+        [Fact]
+        public async Task StagedValueTracking_CorrelatesKeysCaseInsensitively()
+        {
+            // DNS names are inherently case-insensitive, and DigitalOceanProvider already matches
+            // record names with OrdinalIgnoreCase -- the staged-value tracking used to disambiguate
+            // cleanup must not silently fail to correlate a Stage/Cleanup pair that differ only in
+            // casing. Two same-name records are returned in the OPPOSITE order from staging, so a
+            // name-only fallback (what would happen if the case difference broke correlation and
+            // lost the staged value) would delete the wrong one.
+            HttpRequestMessage deleteRequest = null;
+
+            var handler = new FakeHttpMessageHandler(req =>
+            {
+                if (req.Method == HttpMethod.Get && req.RequestUri.PathAndQuery.Contains("/domains?"))
+                {
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
+                        "{\"domains\":[{\"name\":\"example.com\"}],\"links\":{}}");
+                }
+
+                if (req.Method == HttpMethod.Post)
+                {
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.Created,
+                        "{\"domain_record\":{\"id\":1,\"type\":\"TXT\",\"name\":\"_acme-challenge\",\"data\":\"ignored\",\"ttl\":300}}");
+                }
+
+                if (req.Method == HttpMethod.Get && req.RequestUri.PathAndQuery.Contains("/records"))
+                {
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
+                        "{\"domain_records\":[" +
+                        "{\"id\":11,\"type\":\"TXT\",\"name\":\"_acme-challenge\",\"data\":\"value-B\",\"ttl\":300}," +
+                        "{\"id\":10,\"type\":\"TXT\",\"name\":\"_acme-challenge\",\"data\":\"value-A\",\"ttl\":300}]}");
+                }
+
+                if (req.Method == HttpMethod.Delete)
+                {
+                    deleteRequest = req;
+                    return new HttpResponseMessage(HttpStatusCode.NoContent);
+                }
+
+                throw new InvalidOperationException($"Unexpected request: {req.Method} {req.RequestUri}");
+            });
+
+            var provider = new DigitalOceanProvider("token", handler);
+            var validator = new DigitalOceanDomainValidator(provider);
+
+            var stage = await validator.StageValidation("_acme-challenge.Example.com", "value-A", CancellationToken.None);
+            Assert.True(stage.Success);
+
+            var cleanup = await validator.CleanupValidation("_acme-challenge.example.com", CancellationToken.None);
+
+            Assert.True(cleanup.Success);
+            Assert.NotNull(deleteRequest);
+            Assert.EndsWith("domains/example.com/records/10", deleteRequest.RequestUri.PathAndQuery);
+        }
     }
 }

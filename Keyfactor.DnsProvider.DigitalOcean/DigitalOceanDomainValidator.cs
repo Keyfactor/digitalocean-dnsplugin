@@ -25,8 +25,11 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
         // at the same _acme-challenge FQDN). CleanupValidation's own signature (key only, no value)
         // can't tell us which record to delete, so this queue records staging order per key on a
         // best-effort FIFO basis: cleanup for a key removes the oldest still-pending value staged
-        // for it.
-        private readonly Dictionary<string, Queue<string>> _stagedValues = new();
+        // for it. Keyed case-insensitively: DNS names are inherently case-insensitive, and
+        // DigitalOceanProvider already matches record names with StringComparison.OrdinalIgnoreCase
+        // -- an ordinal-cased dictionary here could silently fail to correlate a Stage/Cleanup pair
+        // that differ only in casing, defeating this exact disambiguation mechanism.
+        private readonly Dictionary<string, Queue<string>> _stagedValues = new(StringComparer.OrdinalIgnoreCase);
 
         // Serializes ALL Stage/Cleanup calls for the SAME key end-to-end, including the network
         // round-trip -- not just the queue peek/dequeue. A lock held only around the queue
@@ -45,7 +48,8 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
         // hosting gateway process (restarted periodically for patching), and `key` values are
         // domain names from certificates this account is actually enrolling, not attacker-supplied
         // input from an untrusted boundary.
-        private readonly Dictionary<string, SemaphoreSlim> _keyLocks = new();
+        // Same case-insensitivity rationale as `_stagedValues` above.
+        private readonly Dictionary<string, SemaphoreSlim> _keyLocks = new(StringComparer.OrdinalIgnoreCase);
         private readonly object _locksLock = new();
 
         public DigitalOceanDomainValidator()
@@ -93,15 +97,18 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
 
         public async Task<DomainValidationResult> StageValidation(string key, string value, CancellationToken cancellationToken)
         {
-            var keyLock = GetKeyLock(key);
+            SemaphoreSlim keyLock = null;
             var lockAcquired = false;
             try
             {
-                // Waiting for the lock (not just the work after it) must be inside this try block:
-                // if cancellationToken fires while queued behind another same-key operation,
-                // WaitAsync throws, and this class's documented contract is that NO exception may
-                // escape StageValidation -- it must always come back as a caught, logged
-                // Success=false result.
+                // GetKeyLock (a Dictionary lookup) and the lock wait itself must both be inside
+                // this try block: a null key would make GetKeyLock's TryGetValue throw
+                // ArgumentNullException, and a cancellation while queued behind another same-key
+                // operation makes WaitAsync throw -- either way, this class's documented contract
+                // is that NO exception may escape StageValidation, only a caught, logged
+                // Success=false result. `lockAcquired` staying false in either case correctly
+                // tells the finally below there is nothing to release.
+                keyLock = GetKeyLock(key);
                 await keyLock.WaitAsync(cancellationToken);
                 lockAcquired = true;
 
@@ -138,14 +145,15 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
 
         public async Task<DomainValidationResult> CleanupValidation(string key, CancellationToken cancellationToken)
         {
-            var keyLock = GetKeyLock(key);
+            SemaphoreSlim keyLock = null;
             var lockAcquired = false;
             try
             {
-                // See the identical comment in StageValidation: waiting for the lock must be
-                // inside this try block so a cancellation while queued behind another same-key
-                // operation is caught and converted to a logged Success=false, not an escaping
-                // exception.
+                // See the identical comment in StageValidation: GetKeyLock and the lock wait must
+                // both be inside this try block so a null key or a cancellation while queued behind
+                // another same-key operation is caught and converted to a logged Success=false,
+                // not an escaping exception.
+                keyLock = GetKeyLock(key);
                 await keyLock.WaitAsync(cancellationToken);
                 lockAcquired = true;
 
