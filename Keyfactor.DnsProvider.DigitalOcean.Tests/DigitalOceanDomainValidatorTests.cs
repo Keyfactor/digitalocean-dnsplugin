@@ -100,5 +100,84 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean.Tests
             Assert.True(cleanupB.Success);
             Assert.Equal(new[] { "10", "11" }, deletedIds);
         }
+
+        [Fact]
+        public async Task CleanupValidation_RetainsStagedValueForRetry_WhenDeleteFails()
+        {
+            // The staged value must only be removed from tracking once DeleteRecordAsync actually
+            // succeeds -- popping it up front would lose it on a failed attempt, breaking a retry.
+            var recordsCallCount = 0;
+            var deletePaths = new List<string>();
+
+            var handler = new FakeHttpMessageHandler(req =>
+            {
+                if (req.Method == HttpMethod.Get && req.RequestUri.PathAndQuery.Contains("/domains?"))
+                {
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
+                        "{\"domains\":[{\"name\":\"example.com\"}],\"links\":{}}");
+                }
+
+                if (req.Method == HttpMethod.Post)
+                {
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.Created,
+                        "{\"domain_record\":{\"id\":1,\"type\":\"TXT\",\"name\":\"_acme-challenge\",\"data\":\"ignored\",\"ttl\":300}}");
+                }
+
+                if (req.Method == HttpMethod.Get && req.RequestUri.PathAndQuery.Contains("/records"))
+                {
+                    recordsCallCount++;
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
+                        "{\"domain_records\":[{\"id\":10,\"type\":\"TXT\",\"name\":\"_acme-challenge\",\"data\":\"value-A\",\"ttl\":300}]}");
+                }
+
+                if (req.Method == HttpMethod.Delete)
+                {
+                    deletePaths.Add(req.RequestUri.PathAndQuery);
+                    if (recordsCallCount == 1)
+                    {
+                        return new HttpResponseMessage(HttpStatusCode.InternalServerError)
+                        {
+                            Content = new StringContent("{\"message\":\"boom\"}")
+                        };
+                    }
+                    return new HttpResponseMessage(HttpStatusCode.NoContent);
+                }
+
+                throw new InvalidOperationException($"Unexpected request: {req.Method} {req.RequestUri}");
+            });
+
+            var provider = new DigitalOceanProvider("token", handler);
+            var validator = new DigitalOceanDomainValidator(provider);
+
+            const string key = "_acme-challenge.example.com";
+            var stage = await validator.StageValidation(key, "value-A", CancellationToken.None);
+            Assert.True(stage.Success);
+
+            var firstCleanup = await validator.CleanupValidation(key, CancellationToken.None);
+            Assert.False(firstCleanup.Success);
+
+            var secondCleanup = await validator.CleanupValidation(key, CancellationToken.None);
+            Assert.True(secondCleanup.Success);
+
+            Assert.Equal(2, deletePaths.Count);
+            Assert.All(deletePaths, p => Assert.EndsWith("/10", p));
+        }
+
+        [Fact]
+        public async Task StageValidation_SanitizesKeyInErrorMessageAndLog()
+        {
+            var handler = new FakeHttpMessageHandler(_ =>
+                FakeHttpMessageHandler.Json(HttpStatusCode.Unauthorized, "{\"message\":\"nope\"}"));
+
+            var provider = new DigitalOceanProvider("token", handler);
+            var validator = new DigitalOceanDomainValidator(provider);
+
+            var result = await validator.StageValidation(
+                "_acme-challenge.example.com\r\nFORGED LOG LINE", "value", CancellationToken.None);
+
+            Assert.False(result.Success);
+            Assert.DoesNotContain("\r", result.ErrorMessage);
+            Assert.DoesNotContain("\n", result.ErrorMessage);
+        }
     }
 }

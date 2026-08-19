@@ -184,8 +184,8 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
             }
 
             _logger.LogInformation(
-                "Deleted {RecordType} record '{RelativeName}' in DigitalOcean zone '{Zone}'",
-                recordType, relativeName, zone);
+                "Deleted {RecordType} record '{RelativeName}' ({RecordId}) in DigitalOcean zone '{Zone}', matched by {MatchMode}",
+                recordType, relativeName, match.Id, zone, expectedValue != null ? "value" : "name");
             return true;
         }
 
@@ -204,8 +204,21 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
             var zoneNames = new List<string>();
             var nextUri = "domains?per_page=200";
 
+            // Bounds the loop against a malformed/cyclic `next` link (API bug or future change) so
+            // a broken pagination response can't hang StageValidation/CleanupValidation forever.
+            // 5,000 pages at 200/page is 1,000,000 domains -- far beyond any realistic account size.
+            const int maxPages = 5000;
+            var pageCount = 0;
+
             while (!string.IsNullOrEmpty(nextUri))
             {
+                pageCount++;
+                if (pageCount > maxPages)
+                {
+                    throw new InvalidOperationException(
+                        $"DigitalOcean domain list pagination exceeded {maxPages} pages without terminating; aborting.");
+                }
+
                 // `next` (when present) is an ABSOLUTE URL from DigitalOcean's HATEOAS-style
                 // pagination, e.g. "https://api.digitalocean.com/v2/domains?page=2&per_page=200".
                 // HttpClient.GetAsync uses an absolute URI as-is, ignoring BaseAddress, so passing
