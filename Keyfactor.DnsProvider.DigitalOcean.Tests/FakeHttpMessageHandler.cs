@@ -20,6 +20,9 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean.Tests
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            // Real HttpMessageHandlers honor the token before doing any work; matching that here
+            // lets tests verify a caller's CancellationToken actually reaches the HTTP layer.
+            cancellationToken.ThrowIfCancellationRequested();
             Requests.Add(request);
             return Task.FromResult(_responder(request));
         }

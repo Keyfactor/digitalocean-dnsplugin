@@ -94,19 +94,20 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
             _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         }
 
-        public async Task<bool> CreateRecordAsync(string recordName, string value, string recordType)
+        public async Task<bool> CreateRecordAsync(string recordName, string value, string recordType, CancellationToken cancellationToken = default)
         {
+            recordName = StripControlCharacters(recordName);
             _logger.LogDebug("Creating {RecordType} record for {RecordName}", recordType, recordName);
 
-            var zone = await FindZoneForRecordAsync(recordName);
+            var zone = await FindZoneForRecordAsync(recordName, cancellationToken);
             var relativeName = RelativeRecordName(zone, recordName);
 
             var payload = new { type = recordType, name = relativeName, data = value, ttl = 300 };
             var json = JsonSerializer.Serialize(payload);
             var content = new StringContent(json, Encoding.UTF8, "application/json");
 
-            var response = await _httpClient.PostAsync($"domains/{zone}/records", content);
-            var result = await response.Content.ReadAsStringAsync();
+            var response = await _httpClient.PostAsync($"domains/{zone}/records", content, cancellationToken);
+            var result = await response.Content.ReadAsStringAsync(cancellationToken);
 
             if (!response.IsSuccessStatusCode)
             {
@@ -124,15 +125,16 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
             return true;
         }
 
-        public async Task<bool> DeleteRecordAsync(string recordName, string recordType)
+        public async Task<bool> DeleteRecordAsync(string recordName, string recordType, string expectedValue = null, CancellationToken cancellationToken = default)
         {
+            recordName = StripControlCharacters(recordName);
             _logger.LogDebug("Deleting {RecordType} record for {RecordName}", recordType, recordName);
 
-            var zone = await FindZoneForRecordAsync(recordName);
+            var zone = await FindZoneForRecordAsync(recordName, cancellationToken);
             var relativeName = RelativeRecordName(zone, recordName);
 
-            var recordsResp = await _httpClient.GetAsync($"domains/{zone}/records?type={recordType}");
-            var recordsBody = await recordsResp.Content.ReadAsStringAsync();
+            var recordsResp = await _httpClient.GetAsync($"domains/{zone}/records?type={recordType}", cancellationToken);
+            var recordsBody = await recordsResp.Content.ReadAsStringAsync(cancellationToken);
             if (!recordsResp.IsSuccessStatusCode)
             {
                 _logger.LogError(
@@ -144,9 +146,20 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
             }
 
             var records = JsonSerializer.Deserialize<RecordsResponse>(recordsBody)?.DomainRecords ?? Array.Empty<RecordData>();
-            var match = records.FirstOrDefault(r =>
-                string.Equals(r.Type, recordType, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(r.Name, relativeName, StringComparison.OrdinalIgnoreCase));
+
+            // When multiple records share the same name/type (e.g. an apex + wildcard SAN both
+            // challenging at the same _acme-challenge FQDN with different values), matching by
+            // value as well prevents deleting a sibling authorization's still-pending record.
+            // expectedValue is only known when the caller staged it itself; without it we fall
+            // back to the original name/type-only match to preserve existing single-record behavior.
+            var match = expectedValue != null
+                ? records.FirstOrDefault(r =>
+                    string.Equals(r.Type, recordType, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(r.Name, relativeName, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(r.Data, expectedValue, StringComparison.Ordinal))
+                : records.FirstOrDefault(r =>
+                    string.Equals(r.Type, recordType, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(r.Name, relativeName, StringComparison.OrdinalIgnoreCase));
 
             if (match == null)
             {
@@ -157,11 +170,11 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
                 return true;
             }
 
-            var deleteResp = await _httpClient.DeleteAsync($"domains/{zone}/records/{match.Id}");
+            var deleteResp = await _httpClient.DeleteAsync($"domains/{zone}/records/{match.Id}", cancellationToken);
 
             if (!deleteResp.IsSuccessStatusCode)
             {
-                var deleteBody = await deleteResp.Content.ReadAsStringAsync();
+                var deleteBody = await deleteResp.Content.ReadAsStringAsync(cancellationToken);
                 _logger.LogError(
                     "DigitalOcean API rejected deletion of {RecordType} record '{RelativeName}' ({RecordId}) in zone '{Zone}'. Status: {StatusCode}. Response: {Response}",
                     recordType, relativeName, match.Id, zone, (int)deleteResp.StatusCode, deleteBody);
@@ -181,7 +194,7 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
         /// resolves the zone that owns the given record by longest matching name suffix, e.g.
         /// for "_acme-challenge.www.example.com" it tries "www.example.com", then "example.com".
         /// </summary>
-        private async Task<string> FindZoneForRecordAsync(string recordName)
+        private async Task<string> FindZoneForRecordAsync(string recordName, CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(recordName))
             {
@@ -193,8 +206,15 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
 
             while (!string.IsNullOrEmpty(nextUri))
             {
-                var response = await _httpClient.GetAsync(nextUri);
-                var body = await response.Content.ReadAsStringAsync();
+                // `next` (when present) is an ABSOLUTE URL from DigitalOcean's HATEOAS-style
+                // pagination, e.g. "https://api.digitalocean.com/v2/domains?page=2&per_page=200".
+                // HttpClient.GetAsync uses an absolute URI as-is, ignoring BaseAddress, so passing
+                // it straight through resolves correctly; re-deriving a relative path from it
+                // (previously done via Uri.PathAndQuery.TrimStart('/')) reintroduces the "/v2"
+                // segment and, combined with BaseAddress already ending in "/v2/", doubles it into
+                // "/v2/v2/...", which the real API 404s.
+                var response = await _httpClient.GetAsync(nextUri, cancellationToken);
+                var body = await response.Content.ReadAsStringAsync(cancellationToken);
 
                 if (!response.IsSuccessStatusCode)
                 {
@@ -212,8 +232,7 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
                 var domains = page?.Domains ?? Array.Empty<DomainData>();
                 zoneNames.AddRange(domains.Where(d => d.Name != null).Select(d => d.Name));
 
-                var next = page?.Links?.Pages?.Next;
-                nextUri = string.IsNullOrEmpty(next) ? null : new Uri(next).PathAndQuery.TrimStart('/');
+                nextUri = page?.Links?.Pages?.Next;
             }
 
             if (zoneNames.Count == 0)
@@ -248,6 +267,22 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
             }
 
             return trimmedRecord.Substring(0, trimmedRecord.Length - trimmedZone.Length - 1);
+        }
+
+        /// <summary>
+        /// Strips control characters (including CR/LF) from a gateway-supplied record name before
+        /// it can reach any log message or exception text. A legitimate hostname never contains
+        /// these characters, so this only affects malformed/malicious input — it prevents an
+        /// unvalidated record name from forging log lines (CWE-117) via embedded CRLF.
+        /// </summary>
+        internal static string StripControlCharacters(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return value;
+            }
+
+            return new string(value.Where(c => !char.IsControl(c)).ToArray());
         }
 
         /// <summary>

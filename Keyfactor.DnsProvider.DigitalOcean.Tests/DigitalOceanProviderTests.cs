@@ -154,18 +154,24 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean.Tests
         [Fact]
         public async Task CreateRecordAsync_FollowsPaginationToFindZone()
         {
+            // Distinguishes page 1 vs page 2 by call order rather than a "page=2" substring match —
+            // "per_page=200" itself contains that substring, which previously made the first request
+            // match the "page 2" branch and let a doubled "/v2/v2/..." request URI go undetected.
+            var domainsRequests = new List<HttpRequestMessage>();
+
             var handler = new FakeHttpMessageHandler(req =>
             {
-                if (req.RequestUri.PathAndQuery.Contains("page=2"))
+                if (req.Method == HttpMethod.Get && req.RequestUri.AbsolutePath.Equals("/v2/domains", StringComparison.OrdinalIgnoreCase))
                 {
+                    domainsRequests.Add(req);
+                    if (domainsRequests.Count == 1)
+                    {
+                        return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
+                            "{\"domains\":[{\"name\":\"other.com\"}],\"links\":{\"pages\":{\"next\":\"https://api.digitalocean.com/v2/domains?page=2&per_page=200\"}}}");
+                    }
+
                     return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
                         "{\"domains\":[{\"name\":\"example.com\"}],\"links\":{}}");
-                }
-
-                if (req.Method == HttpMethod.Get && req.RequestUri.PathAndQuery.Contains("/domains?"))
-                {
-                    return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
-                        "{\"domains\":[{\"name\":\"other.com\"}],\"links\":{\"pages\":{\"next\":\"https://api.digitalocean.com/v2/domains?page=2&per_page=200\"}}}");
                 }
 
                 if (req.Method == HttpMethod.Post)
@@ -182,6 +188,8 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean.Tests
             var result = await provider.CreateRecordAsync("_acme-challenge.example.com", "abc123", "TXT");
 
             Assert.True(result);
+            Assert.Equal(2, domainsRequests.Count);
+            Assert.Equal("https://api.digitalocean.com/v2/domains?page=2&per_page=200", domainsRequests[1].RequestUri.ToString());
         }
 
         [Fact]
@@ -254,6 +262,114 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean.Tests
         {
             Assert.Throws<ArgumentException>(() => new DigitalOceanProvider(apiToken, new FakeHttpMessageHandler(_ =>
                 throw new InvalidOperationException("Should not make HTTP calls"))));
+        }
+
+        [Fact]
+        public async Task DeleteRecordAsync_WithExpectedValue_DeletesOnlyTheMatchingRecord()
+        {
+            // Simulates two TXT records sharing the same name (e.g. an apex + wildcard SAN both
+            // challenging at the same _acme-challenge FQDN with different values) — the delete must
+            // target the record whose value matches, not just the first record with that name.
+            HttpRequestMessage deleteRequest = null;
+
+            var handler = new FakeHttpMessageHandler(req =>
+            {
+                if (req.Method == HttpMethod.Get && req.RequestUri.PathAndQuery.Contains("/domains?"))
+                {
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
+                        "{\"domains\":[{\"name\":\"example.com\"}],\"links\":{}}");
+                }
+
+                if (req.Method == HttpMethod.Get && req.RequestUri.PathAndQuery.Contains("/records"))
+                {
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
+                        "{\"domain_records\":[" +
+                        "{\"id\":7,\"type\":\"TXT\",\"name\":\"_acme-challenge\",\"data\":\"first-value\",\"ttl\":300}," +
+                        "{\"id\":8,\"type\":\"TXT\",\"name\":\"_acme-challenge\",\"data\":\"second-value\",\"ttl\":300}]}");
+                }
+
+                if (req.Method == HttpMethod.Delete)
+                {
+                    deleteRequest = req;
+                    return new HttpResponseMessage(HttpStatusCode.NoContent);
+                }
+
+                throw new InvalidOperationException($"Unexpected request: {req.Method} {req.RequestUri}");
+            });
+
+            var provider = new DigitalOceanProvider("token", handler);
+
+            var result = await provider.DeleteRecordAsync("_acme-challenge.example.com", "TXT", "second-value");
+
+            Assert.True(result);
+            Assert.NotNull(deleteRequest);
+            Assert.EndsWith("domains/example.com/records/8", deleteRequest.RequestUri.PathAndQuery);
+        }
+
+        [Fact]
+        public async Task DeleteRecordAsync_WithExpectedValue_IsIdempotentWhenNoRecordMatchesTheValue()
+        {
+            var handler = new FakeHttpMessageHandler(req =>
+            {
+                if (req.Method == HttpMethod.Get && req.RequestUri.PathAndQuery.Contains("/domains?"))
+                {
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
+                        "{\"domains\":[{\"name\":\"example.com\"}],\"links\":{}}");
+                }
+
+                if (req.Method == HttpMethod.Get && req.RequestUri.PathAndQuery.Contains("/records"))
+                {
+                    return FakeHttpMessageHandler.Json(HttpStatusCode.OK,
+                        "{\"domain_records\":[{\"id\":7,\"type\":\"TXT\",\"name\":\"_acme-challenge\",\"data\":\"other-value\",\"ttl\":300}]}");
+                }
+
+                throw new InvalidOperationException($"Unexpected request: {req.Method} {req.RequestUri}");
+            });
+
+            var provider = new DigitalOceanProvider("token", handler);
+
+            var result = await provider.DeleteRecordAsync("_acme-challenge.example.com", "TXT", "expected-value");
+
+            Assert.True(result);
+        }
+
+        [Fact]
+        public async Task CreateRecordAsync_ObservesCancellationToken()
+        {
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var handler = new FakeHttpMessageHandler(_ =>
+                throw new InvalidOperationException("HTTP call should not be made when the token is already canceled"));
+
+            var provider = new DigitalOceanProvider("token", handler);
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => provider.CreateRecordAsync("_acme-challenge.example.com", "abc123", "TXT", cts.Token));
+        }
+
+        [Fact]
+        public async Task DeleteRecordAsync_ObservesCancellationToken()
+        {
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var handler = new FakeHttpMessageHandler(_ =>
+                throw new InvalidOperationException("HTTP call should not be made when the token is already canceled"));
+
+            var provider = new DigitalOceanProvider("token", handler);
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => provider.DeleteRecordAsync("_acme-challenge.example.com", "TXT", cancellationToken: cts.Token));
+        }
+
+        [Theory]
+        [InlineData("_acme-challenge.example.com\r\nFORGED LOG LINE", "_acme-challenge.example.comFORGED LOG LINE")]
+        [InlineData("plain.example.com", "plain.example.com")]
+        [InlineData(null, null)]
+        public void StripControlCharacters_RemovesControlCharactersOnly(string input, string expected)
+        {
+            Assert.Equal(expected, DigitalOceanProvider.StripControlCharacters(input));
         }
     }
 }
