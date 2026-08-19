@@ -1,0 +1,10 @@
+{
+  "extensions": {
+    "Keyfactor.AnyGateway.Extensions.IDomainValidator": {
+      "DigitalOceanDomainValidator": {
+        "assemblypath": "DigitalOceanDomainValidator.dll",
+        "TypeFullName": "Keyfactor.Extensions.DomainValidator.DigitalOcean.DigitalOceanDomainValidator"
+      }
+    }
+  }
+}

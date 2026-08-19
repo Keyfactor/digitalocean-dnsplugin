@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="Keyfactor.DnsProvider.DigitalOcean/Keyfactor.DnsProvider.DigitalOcean.csproj" />
+  <Project Path="Keyfactor.DnsProvider.DigitalOcean.Tests/Keyfactor.DnsProvider.DigitalOcean.Tests.csproj" />
+</Solution>
