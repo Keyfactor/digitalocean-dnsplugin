@@ -1,0 +1,36 @@
+{
+  "$schema": "https://keyfactor.github.io/v2/integration-manifest-schema.json",
+  "integration_type": "dns-plugin",
+  "name": "DigitalOcean DNS Plugin",
+  "status": "production",
+  "support_level": "kf-supported",
+  "update_catalog": true,
+  "link_github": false,
+  "description": "DNS-01 challenge validation provider using DigitalOcean. Implements the IDomainValidator interface to create, manage, and clean up DNS TXT records in DigitalOcean-hosted domains for ACME domain validation. Authenticates via a Bearer Personal Access Token.",
+  "release_dir": "Keyfactor.DnsProvider.DigitalOcean/bin/Release",
+  "release_project": "Keyfactor.DnsProvider.DigitalOcean/Keyfactor.DnsProvider.DigitalOcean.csproj",
+  "about": {
+    "dns_provider": {
+      "providerName": "digitalocean",
+      "displayName": "DigitalOcean",
+      "assemblyName": "DigitalOceanDomainValidator",
+      "fullyQualifiedClassName": "Keyfactor.Extensions.DomainValidator.DigitalOcean.DigitalOceanDomainValidator",
+      "validationType": "dns-01",
+      "providerEndpoint": "api.digitalocean.com",
+      "providerDocsUrl": "https://docs.digitalocean.com/reference/api/reference/domains/",
+      "serviceStatusUrl": "https://status.digitalocean.com/",
+      "dns_provider_config": [
+        {
+          "Name": "DigitalOcean_ApiToken",
+          "DisplayName": "DigitalOcean API Token",
+          "DataType": 2,
+          "InstanceLevel": false,
+          "Hidden": true,
+          "DefaultValue": "",
+          "Required": true,
+          "Description": "DigitalOcean Personal Access Token with domain read/create/delete scopes. Created under API > Tokens in the DigitalOcean control panel."
+        }
+      ]
+    }
+  }
+}
