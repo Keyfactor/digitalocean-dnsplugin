@@ -20,8 +20,19 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean.Tests
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            // Real HttpMessageHandlers honor the token before doing any work; matching that here
+            // lets tests verify a caller's CancellationToken actually reaches the HTTP layer.
+            cancellationToken.ThrowIfCancellationRequested();
             Requests.Add(request);
-            return Task.FromResult(_responder(request));
+
+            // Run the responder on a background thread rather than returning an already-completed
+            // Task.FromResult(...). A synchronously-completed task lets `await` continue inline on
+            // the calling thread with no real suspension -- so a responder that blocks (simulating
+            // slow I/O) blocks the CALLER's thread too, and a "fire without awaiting" call in a test
+            // doesn't actually run concurrently with the rest of that test method. Task.Run gives
+            // tests genuine interleaving to exercise real concurrency (e.g. two calls contending for
+            // the same lock).
+            return Task.Run(() => _responder(request), cancellationToken);
         }
 
         public static HttpResponseMessage Json(HttpStatusCode status, string body)
