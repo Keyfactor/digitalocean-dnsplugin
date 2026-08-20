@@ -20,6 +20,50 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
         private DigitalOceanProvider _provider;
         private Dictionary<string, object> _configuration;
 
+        // Tracks the value staged for each key so CleanupValidation can disambiguate between
+        // multiple TXT records sharing the same name (e.g. an apex + wildcard SAN both challenging
+        // at the same _acme-challenge FQDN). CleanupValidation's own signature (key only, no value)
+        // can't tell us which record to delete, so this queue records staging order per key on a
+        // best-effort FIFO basis: cleanup for a key removes the oldest still-pending value staged
+        // for it. Keyed case-insensitively: DNS names are inherently case-insensitive, and
+        // DigitalOceanProvider already matches record names with StringComparison.OrdinalIgnoreCase
+        // -- an ordinal-cased dictionary here could silently fail to correlate a Stage/Cleanup pair
+        // that differ only in casing, defeating this exact disambiguation mechanism.
+        private readonly Dictionary<string, Queue<string>> _stagedValues = new(StringComparer.OrdinalIgnoreCase);
+
+        // Serializes ALL Stage/Cleanup calls for the SAME key end-to-end, including the network
+        // round-trip -- not just the queue peek/dequeue. A lock held only around the queue
+        // read/write (and released across the `await DeleteRecordAsync(...)` call) is not enough:
+        // two concurrent CleanupValidation calls for the same key could both peek the same head
+        // value before either dequeues it, so one call's delete succeeds while the other's
+        // redundant delete finds nothing (idempotent no-op) and ALSO reports success -- silently
+        // leaking the second call's real, distinct record and leaving a stale queue entry that
+        // nothing ever dequeues. Different keys still run fully in parallel; only same-key
+        // operations are serialized. Guarded by `_locksLock`, a separate, short-lived lock used
+        // only to get-or-create a key's semaphore -- never held across an await.
+        //
+        // Neither this dictionary nor `_stagedValues` ever evicts an entry, so both grow for the
+        // life of the validator instance, one entry per distinct FQDN ever staged/cleaned up.
+        // Accepted: per-entry cost is small, a validator instance's lifetime is bounded by the
+        // hosting gateway process (restarted periodically for patching), and `key` values are
+        // domain names from certificates this account is actually enrolling, not attacker-supplied
+        // input from an untrusted boundary.
+        // Same case-insensitivity rationale as `_stagedValues` above.
+        private readonly Dictionary<string, SemaphoreSlim> _keyLocks = new(StringComparer.OrdinalIgnoreCase);
+        private readonly object _locksLock = new();
+
+        public DigitalOceanDomainValidator()
+        {
+        }
+
+        // Internal constructor to allow unit tests to inject a fake provider without going through
+        // Initialize (which requires a real IDomainValidatorConfigProvider and constructs its own
+        // DigitalOceanProvider from a config-supplied API token).
+        internal DigitalOceanDomainValidator(DigitalOceanProvider provider)
+        {
+            _provider = provider;
+        }
+
         public Dictionary<string, PropertyConfigInfo> GetDomainValidatorAnnotations()
         {
             return new Dictionary<string, PropertyConfigInfo>()
@@ -44,6 +88,7 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
 
             if (string.IsNullOrWhiteSpace(apiToken))
             {
+                _logger.LogWarning("DigitalOcean_ApiToken is missing or empty; plugin initialization cannot proceed");
                 throw new ArgumentException("DigitalOcean_ApiToken is required");
             }
 
@@ -52,47 +97,120 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
 
         public async Task<DomainValidationResult> StageValidation(string key, string value, CancellationToken cancellationToken)
         {
+            SemaphoreSlim keyLock = null;
+            var lockAcquired = false;
             try
             {
-                var success = await _provider.CreateRecordAsync(key, value, RecordTypeName);
+                // GetKeyLock (a Dictionary lookup) and the lock wait itself must both be inside
+                // this try block: a null key would make GetKeyLock's TryGetValue throw
+                // ArgumentNullException, and a cancellation while queued behind another same-key
+                // operation makes WaitAsync throw -- either way, this class's documented contract
+                // is that NO exception may escape StageValidation, only a caught, logged
+                // Success=false result. `lockAcquired` staying false in either case correctly
+                // tells the finally below there is nothing to release.
+                keyLock = GetKeyLock(key);
+                await keyLock.WaitAsync(cancellationToken);
+                lockAcquired = true;
+
+                var success = await _provider.CreateRecordAsync(key, value, RecordTypeName, cancellationToken);
+
+                if (success)
+                {
+                    GetQueue(key, createIfMissing: true).Enqueue(value);
+                }
 
                 return new DomainValidationResult
                 {
                     Success = success,
-                    ErrorMessage = success ? null : $"Failed to create DNS {RecordTypeName} record for {key}"
+                    ErrorMessage = success ? null : $"Failed to create DNS {RecordTypeName} record for {SafeForLog(key)}"
                 };
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "DigitalOcean StageValidation failed for {RecordType} record '{Key}'", RecordTypeName, key);
+                _logger.LogError(ex, "DigitalOcean StageValidation failed for {RecordType} record '{Key}'", RecordTypeName, SafeForLog(key));
                 return new DomainValidationResult
                 {
                     Success = false,
-                    ErrorMessage = $"Failed to create {RecordTypeName} record for {key}: {ex.Message}"
+                    ErrorMessage = $"Failed to create {RecordTypeName} record for {SafeForLog(key)}: {ex.Message}"
                 };
+            }
+            finally
+            {
+                if (lockAcquired)
+                {
+                    keyLock.Release();
+                }
             }
         }
 
         public async Task<DomainValidationResult> CleanupValidation(string key, CancellationToken cancellationToken)
         {
+            SemaphoreSlim keyLock = null;
+            var lockAcquired = false;
             try
             {
-                var success = await _provider.DeleteRecordAsync(key, RecordTypeName);
+                // See the identical comment in StageValidation: GetKeyLock and the lock wait must
+                // both be inside this try block so a null key or a cancellation while queued behind
+                // another same-key operation is caught and converted to a logged Success=false,
+                // not an escaping exception.
+                keyLock = GetKeyLock(key);
+                await keyLock.WaitAsync(cancellationToken);
+                lockAcquired = true;
+
+                // Peek (don't remove) the oldest still-pending staged value. It is only actually
+                // dequeued below once DeleteRecordAsync confirms success — removing it up front
+                // would permanently lose it if the delete failed/was retried, corrupting the queue
+                // for any later retry or sibling cleanup call on this key. Holding `keyLock` for
+                // the entire method (including the network round-trip) guarantees no other
+                // Stage/Cleanup call for this SAME key can observe or mutate the queue in between,
+                // so this peek-then-conditionally-dequeue is race-free for a given key.
+                var queue = GetQueue(key, createIfMissing: false);
+                var outstandingCount = queue?.Count ?? 0;
+                var expectedValue = outstandingCount > 0 ? queue.Peek() : null;
+
+                if (outstandingCount > 1)
+                {
+                    // CleanupValidation's own contract gives us no challenge value to match against
+                    // (only `key`), so when more than one value is outstanding for the same key
+                    // (e.g. an apex + wildcard SAN sharing one _acme-challenge FQDN) we cannot know
+                    // FOR CERTAIN which one this specific cleanup call is for. We fall back to a
+                    // best-effort FIFO match (oldest staged, oldest cleaned up) rather than refusing
+                    // to clean up at all, but that assumption can be wrong if completion order
+                    // doesn't match staging order -- surfacing it here so it's operationally visible
+                    // rather than a silent, unverifiable guess.
+                    _logger.LogWarning(
+                        "{Count} {RecordType} values are still staged for '{Key}'; cleanup will match the oldest staged value on a best-effort basis, since CleanupValidation does not receive the specific challenge value",
+                        outstandingCount, RecordTypeName, SafeForLog(key));
+                }
+
+                var success = await _provider.DeleteRecordAsync(key, RecordTypeName, expectedValue, cancellationToken);
+
+                if (success && expectedValue != null)
+                {
+                    queue.Dequeue();
+                }
 
                 return new DomainValidationResult
                 {
                     Success = success,
-                    ErrorMessage = success ? null : $"Failed to delete DNS {RecordTypeName} record for {key}"
+                    ErrorMessage = success ? null : $"Failed to delete DNS {RecordTypeName} record for {SafeForLog(key)}"
                 };
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "DigitalOcean CleanupValidation failed for {RecordType} record '{Key}'", RecordTypeName, key);
+                _logger.LogError(ex, "DigitalOcean CleanupValidation failed for {RecordType} record '{Key}'", RecordTypeName, SafeForLog(key));
                 return new DomainValidationResult
                 {
                     Success = false,
-                    ErrorMessage = $"Failed to delete {RecordTypeName} record for {key}: {ex.Message}"
+                    ErrorMessage = $"Failed to delete {RecordTypeName} record for {SafeForLog(key)}: {ex.Message}"
                 };
+            }
+            finally
+            {
+                if (lockAcquired)
+                {
+                    keyLock.Release();
+                }
             }
         }
 
@@ -103,6 +221,7 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
             var apiToken = GetConfigValue("DigitalOcean_ApiToken");
             if (string.IsNullOrWhiteSpace(apiToken))
             {
+                _logger.LogWarning("DigitalOcean_ApiToken is missing or empty; configuration validation failed");
                 throw new ArgumentException("DigitalOcean_ApiToken is required");
             }
 
@@ -116,6 +235,49 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
                 return value?.ToString() ?? string.Empty;
             }
             return string.Empty;
+        }
+
+        // DigitalOceanProvider sanitizes recordName before using it in ITS OWN log/exception
+        // messages, but that sanitized copy never crosses back into this class's `key` parameter
+        // (strings are immutable/passed by value) -- this class has its own independent log and
+        // ErrorMessage call sites that log/embed the raw `key`, so it needs its own sanitization
+        // pass to close the same CWE-117 CRLF log-forging gap at this layer.
+        private static string SafeForLog(string key) => DigitalOceanProvider.StripControlCharacters(key);
+
+        private SemaphoreSlim GetKeyLock(string key)
+        {
+            lock (_locksLock)
+            {
+                if (!_keyLocks.TryGetValue(key, out var keyLock))
+                {
+                    keyLock = new SemaphoreSlim(1, 1);
+                    _keyLocks[key] = keyLock;
+                }
+                return keyLock;
+            }
+        }
+
+        // Only ever called while holding that key's semaphore (see GetKeyLock), so the returned
+        // Queue<string> is never accessed by more than one caller at a time and needs no further
+        // locking around Enqueue/Peek/Dequeue -- only the lookup/creation in the shared dictionary
+        // itself needs the brief `_locksLock` (reused here rather than adding a third lock, since
+        // it is already the lock guarding shared-dictionary structural changes for this class).
+        private Queue<string> GetQueue(string key, bool createIfMissing)
+        {
+            lock (_locksLock)
+            {
+                if (_stagedValues.TryGetValue(key, out var queue))
+                {
+                    return queue;
+                }
+                if (!createIfMissing)
+                {
+                    return null;
+                }
+                queue = new Queue<string>();
+                _stagedValues[key] = queue;
+                return queue;
+            }
         }
     }
 }

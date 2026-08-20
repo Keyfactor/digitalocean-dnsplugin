@@ -13,6 +13,12 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
     {
         private static readonly ILogger _logger = LogHandler.GetClassLogger<DigitalOceanProvider>();
 
+        // Bounds any DigitalOcean list-endpoint pagination loop against a malformed/cyclic `next`
+        // link (API bug or future change) so a broken pagination response can't hang
+        // StageValidation/CleanupValidation forever. 5,000 pages at 200/page is 1,000,000 items --
+        // far beyond any realistic account's domain or per-zone record count.
+        private const int MaxPaginationPages = 5000;
+
         private readonly HttpClient _httpClient;
 
         private class DomainData
@@ -64,6 +70,9 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
         {
             [JsonPropertyName("domain_records")]
             public RecordData[] DomainRecords { get; set; }
+
+            [JsonPropertyName("links")]
+            public LinksData Links { get; set; }
         }
 
         private class CreateRecordResponse
@@ -87,26 +96,39 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
 
             _httpClient = new HttpClient(handler)
             {
-                BaseAddress = new Uri("https://api.digitalocean.com/v2/")
+                BaseAddress = new Uri("https://api.digitalocean.com/v2/"),
+                // DigitalOceanDomainValidator holds a per-key lock across the entire Stage/Cleanup
+                // call, including every HTTP request this class makes -- without an explicit bound,
+                // a single stalled DigitalOcean connection falls back to HttpClient's 100-second
+                // default, and a Create/Delete can make 2-3 sequential requests, so an unrelated
+                // legitimate operation for the SAME key could queue behind a hung one for several
+                // minutes. 30 seconds is generous for a DNS record CRUD call under normal conditions.
+                Timeout = TimeSpan.FromSeconds(30)
             };
 
             _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiToken);
             _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         }
 
-        public async Task<bool> CreateRecordAsync(string recordName, string value, string recordType)
+        public async Task<bool> CreateRecordAsync(string recordName, string value, string recordType, CancellationToken cancellationToken = default)
         {
+            recordName = StripControlCharacters(recordName);
             _logger.LogDebug("Creating {RecordType} record for {RecordName}", recordType, recordName);
 
-            var zone = await FindZoneForRecordAsync(recordName);
+            var zone = await FindZoneForRecordAsync(recordName, cancellationToken);
             var relativeName = RelativeRecordName(zone, recordName);
 
             var payload = new { type = recordType, name = relativeName, data = value, ttl = 300 };
             var json = JsonSerializer.Serialize(payload);
             var content = new StringContent(json, Encoding.UTF8, "application/json");
 
-            var response = await _httpClient.PostAsync($"domains/{zone}/records", content);
-            var result = await response.Content.ReadAsStringAsync();
+            var response = await _httpClient.PostAsync($"domains/{zone}/records", content, cancellationToken);
+            // Sanitized immediately: this is DigitalOcean-controlled response content, not just
+            // plugin-derived values, but it still reaches log/exception sinks below, so it's
+            // subject to the same CWE-117 CRLF log-forging risk as any other logged value. Valid
+            // JSON never contains raw (unescaped) control characters, so this is a no-op on the
+            // success/deserialization path.
+            var result = StripControlCharacters(await response.Content.ReadAsStringAsync(cancellationToken));
 
             if (!response.IsSuccessStatusCode)
             {
@@ -118,35 +140,70 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
                     $"DigitalOcean API returned {(int)response.StatusCode} ({response.StatusCode}) creating {recordType} record '{relativeName}' in zone '{zone}': {result}");
             }
 
+            var createdId = JsonSerializer.Deserialize<CreateRecordResponse>(result)?.DomainRecord?.Id;
             _logger.LogInformation(
-                "Created {RecordType} record '{RelativeName}' in DigitalOcean zone '{Zone}'",
-                recordType, relativeName, zone);
+                "Created {RecordType} record '{RelativeName}' ({RecordId}) in DigitalOcean zone '{Zone}'",
+                recordType, relativeName, createdId, zone);
             return true;
         }
 
-        public async Task<bool> DeleteRecordAsync(string recordName, string recordType)
+        public async Task<bool> DeleteRecordAsync(string recordName, string recordType, string expectedValue = null, CancellationToken cancellationToken = default)
         {
+            recordName = StripControlCharacters(recordName);
             _logger.LogDebug("Deleting {RecordType} record for {RecordName}", recordType, recordName);
 
-            var zone = await FindZoneForRecordAsync(recordName);
+            var zone = await FindZoneForRecordAsync(recordName, cancellationToken);
             var relativeName = RelativeRecordName(zone, recordName);
 
-            var recordsResp = await _httpClient.GetAsync($"domains/{zone}/records?type={recordType}");
-            var recordsBody = await recordsResp.Content.ReadAsStringAsync();
-            if (!recordsResp.IsSuccessStatusCode)
-            {
-                _logger.LogError(
-                    "DigitalOcean API failed to list records for zone '{Zone}'. Status: {StatusCode}. Response: {Response}",
-                    zone, (int)recordsResp.StatusCode, recordsBody);
+            // Paged the same way as FindZoneForRecordAsync's domain listing: a zone can accumulate
+            // more than one page of records (other TXT records, multiple concurrent SAN
+            // challenges, or previously-stranded records), and an un-paginated fetch would make
+            // records on page 2+ invisible to the match below -- silently treating a genuinely
+            // still-live record as "not found" and reporting cleanup as complete without deleting
+            // it, leaving it in DNS indefinitely.
+            var records = new List<RecordData>();
+            var nextRecordsUri = $"domains/{zone}/records?type={recordType}&per_page=200";
+            var recordsPageCount = 0;
 
-                throw new InvalidOperationException(
-                    $"DigitalOcean API returned {(int)recordsResp.StatusCode} ({recordsResp.StatusCode}) listing records in zone '{zone}': {recordsBody}");
+            while (!string.IsNullOrEmpty(nextRecordsUri))
+            {
+                recordsPageCount++;
+                if (recordsPageCount > MaxPaginationPages)
+                {
+                    throw new InvalidOperationException(
+                        $"DigitalOcean record list pagination for zone '{zone}' exceeded {MaxPaginationPages} pages without terminating; aborting.");
+                }
+
+                var recordsResp = await _httpClient.GetAsync(nextRecordsUri, cancellationToken);
+                var recordsBody = StripControlCharacters(await recordsResp.Content.ReadAsStringAsync(cancellationToken));
+                if (!recordsResp.IsSuccessStatusCode)
+                {
+                    _logger.LogError(
+                        "DigitalOcean API failed to list records for zone '{Zone}'. Status: {StatusCode}. Response: {Response}",
+                        zone, (int)recordsResp.StatusCode, recordsBody);
+
+                    throw new InvalidOperationException(
+                        $"DigitalOcean API returned {(int)recordsResp.StatusCode} ({recordsResp.StatusCode}) listing records in zone '{zone}': {recordsBody}");
+                }
+
+                var recordsPage = JsonSerializer.Deserialize<RecordsResponse>(recordsBody);
+                records.AddRange(recordsPage?.DomainRecords ?? Array.Empty<RecordData>());
+                nextRecordsUri = recordsPage?.Links?.Pages?.Next;
             }
 
-            var records = JsonSerializer.Deserialize<RecordsResponse>(recordsBody)?.DomainRecords ?? Array.Empty<RecordData>();
-            var match = records.FirstOrDefault(r =>
-                string.Equals(r.Type, recordType, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(r.Name, relativeName, StringComparison.OrdinalIgnoreCase));
+            // When multiple records share the same name/type (e.g. an apex + wildcard SAN both
+            // challenging at the same _acme-challenge FQDN with different values), matching by
+            // value as well prevents deleting a sibling authorization's still-pending record.
+            // expectedValue is only known when the caller staged it itself; without it we fall
+            // back to the original name/type-only match to preserve existing single-record behavior.
+            var match = expectedValue != null
+                ? records.FirstOrDefault(r =>
+                    string.Equals(r.Type, recordType, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(r.Name, relativeName, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(r.Data, expectedValue, StringComparison.Ordinal))
+                : records.FirstOrDefault(r =>
+                    string.Equals(r.Type, recordType, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(r.Name, relativeName, StringComparison.OrdinalIgnoreCase));
 
             if (match == null)
             {
@@ -157,11 +214,11 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
                 return true;
             }
 
-            var deleteResp = await _httpClient.DeleteAsync($"domains/{zone}/records/{match.Id}");
+            var deleteResp = await _httpClient.DeleteAsync($"domains/{zone}/records/{match.Id}", cancellationToken);
 
             if (!deleteResp.IsSuccessStatusCode)
             {
-                var deleteBody = await deleteResp.Content.ReadAsStringAsync();
+                var deleteBody = StripControlCharacters(await deleteResp.Content.ReadAsStringAsync(cancellationToken));
                 _logger.LogError(
                     "DigitalOcean API rejected deletion of {RecordType} record '{RelativeName}' ({RecordId}) in zone '{Zone}'. Status: {StatusCode}. Response: {Response}",
                     recordType, relativeName, match.Id, zone, (int)deleteResp.StatusCode, deleteBody);
@@ -171,8 +228,8 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
             }
 
             _logger.LogInformation(
-                "Deleted {RecordType} record '{RelativeName}' in DigitalOcean zone '{Zone}'",
-                recordType, relativeName, zone);
+                "Deleted {RecordType} record '{RelativeName}' ({RecordId}) in DigitalOcean zone '{Zone}', matched by {MatchMode}",
+                recordType, relativeName, match.Id, zone, expectedValue != null ? "value" : "name");
             return true;
         }
 
@@ -181,7 +238,7 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
         /// resolves the zone that owns the given record by longest matching name suffix, e.g.
         /// for "_acme-challenge.www.example.com" it tries "www.example.com", then "example.com".
         /// </summary>
-        private async Task<string> FindZoneForRecordAsync(string recordName)
+        private async Task<string> FindZoneForRecordAsync(string recordName, CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(recordName))
             {
@@ -190,11 +247,26 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
 
             var zoneNames = new List<string>();
             var nextUri = "domains?per_page=200";
+            var pageCount = 0;
 
             while (!string.IsNullOrEmpty(nextUri))
             {
-                var response = await _httpClient.GetAsync(nextUri);
-                var body = await response.Content.ReadAsStringAsync();
+                pageCount++;
+                if (pageCount > MaxPaginationPages)
+                {
+                    throw new InvalidOperationException(
+                        $"DigitalOcean domain list pagination exceeded {MaxPaginationPages} pages without terminating; aborting.");
+                }
+
+                // `next` (when present) is an ABSOLUTE URL from DigitalOcean's HATEOAS-style
+                // pagination, e.g. "https://api.digitalocean.com/v2/domains?page=2&per_page=200".
+                // HttpClient.GetAsync uses an absolute URI as-is, ignoring BaseAddress, so passing
+                // it straight through resolves correctly; re-deriving a relative path from it
+                // (previously done via Uri.PathAndQuery.TrimStart('/')) reintroduces the "/v2"
+                // segment and, combined with BaseAddress already ending in "/v2/", doubles it into
+                // "/v2/v2/...", which the real API 404s.
+                var response = await _httpClient.GetAsync(nextUri, cancellationToken);
+                var body = StripControlCharacters(await response.Content.ReadAsStringAsync(cancellationToken));
 
                 if (!response.IsSuccessStatusCode)
                 {
@@ -212,8 +284,7 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
                 var domains = page?.Domains ?? Array.Empty<DomainData>();
                 zoneNames.AddRange(domains.Where(d => d.Name != null).Select(d => d.Name));
 
-                var next = page?.Links?.Pages?.Next;
-                nextUri = string.IsNullOrEmpty(next) ? null : new Uri(next).PathAndQuery.TrimStart('/');
+                nextUri = page?.Links?.Pages?.Next;
             }
 
             if (zoneNames.Count == 0)
@@ -248,6 +319,22 @@ namespace Keyfactor.Extensions.DomainValidator.DigitalOcean
             }
 
             return trimmedRecord.Substring(0, trimmedRecord.Length - trimmedZone.Length - 1);
+        }
+
+        /// <summary>
+        /// Strips control characters (including CR/LF) from a gateway-supplied record name before
+        /// it can reach any log message or exception text. A legitimate hostname never contains
+        /// these characters, so this only affects malformed/malicious input — it prevents an
+        /// unvalidated record name from forging log lines (CWE-117) via embedded CRLF.
+        /// </summary>
+        internal static string StripControlCharacters(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return value;
+            }
+
+            return new string(value.Where(c => !char.IsControl(c)).ToArray());
         }
 
         /// <summary>
