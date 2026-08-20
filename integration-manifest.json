@@ -5,7 +5,7 @@
   "status": "production",
   "support_level": "kf-supported",
   "update_catalog": true,
-  "link_github": false,
+  "link_github": true,
   "description": "DNS-01 challenge validation provider using DigitalOcean. Implements the IDomainValidator interface to create, manage, and clean up DNS TXT records in DigitalOcean-hosted domains for ACME domain validation. Authenticates via a Bearer Personal Access Token.",
   "release_dir": "Keyfactor.DnsProvider.DigitalOcean/bin/Release",
   "release_project": "Keyfactor.DnsProvider.DigitalOcean/Keyfactor.DnsProvider.DigitalOcean.csproj",
